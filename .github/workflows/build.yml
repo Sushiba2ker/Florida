@@ -26,28 +26,32 @@ jobs:
             const majorVersions = [15, 16, 17];
             const versions = [];
 
-            // Fetch releases (multiple pages to find older majors)
-            let allReleases = [];
-            for (let page = 1; page <= 5; page++) {
-              const { data } = await github.repos.listReleases({
-                owner: 'frida',
-                repo: 'frida',
-                per_page: 100,
-                page: page
-              });
-              allReleases = allReleases.concat(data);
-              if (data.length < 100) break;
-            }
-
+            // Use Tags API (lightweight) instead of Releases API (heavy, causes 504)
+            // For each major version, scan tags to find the latest semver tag
             for (const major of majorVersions) {
-              const release = allReleases.find(r =>
-                r.tag_name.startsWith(`${major}.`) && !r.prerelease && !r.draft
-              );
-              if (release) {
-                versions.push(release.tag_name);
-                core.info(`Found v${major}.x latest: ${release.tag_name}`);
-              } else {
-                core.warning(`No release found for major version ${major}`);
+              let found = false;
+              for (let page = 1; page <= 10 && !found; page++) {
+                const { data: tags } = await github.repos.listTags({
+                  owner: 'frida',
+                  repo: 'frida',
+                  per_page: 100,
+                  page: page
+                });
+                if (tags.length === 0) break;
+
+                // Tags are returned newest-first, find first matching major version
+                const match = tags.find(t => {
+                  const name = t.name;
+                  return name.match(new RegExp(`^${major}\\.\\d+\\.\\d+$`));
+                });
+                if (match) {
+                  versions.push(match.name);
+                  core.info(`Found v${major}.x latest: ${match.name}`);
+                  found = true;
+                }
+              }
+              if (!found) {
+                core.warning(`No tag found for major version ${major}`);
               }
             }
 
