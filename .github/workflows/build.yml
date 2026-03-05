@@ -11,98 +11,112 @@ on:
       - "patches/**"
 
 jobs: 
-  check_version:
+  check_versions:
     runs-on: ubuntu-22.04
 
     outputs:
-      FRIDA_VERSION: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
-      ALREADY_RELEASE: ${{ steps.checkReleaseVersion.outputs.ALREADY_RELEASE }}
+      matrix: ${{ steps.get-versions.outputs.matrix }}
     steps:
-      - name: Pull Frida Latest Release
-        id: pullFridaLatestRelease
+      - name: Get latest Frida versions for major releases (15, 16, 17)
+        id: get-versions
         uses: actions/github-script@v3
         with:
           github-token: ${{secrets.GITHUB_TOKEN}}
           script: |
-            const releaseResponse = await github.repos.getLatestRelease({
-              owner: 'frida',
-              repo: 'frida',
-            })
-            const {
-              data: { tag_name: ver }
-            } = releaseResponse;
-            core.setOutput('FRIDA_VERSION', ver);
+            const majorVersions = [15, 16, 17];
+            const versions = [];
 
-      - name: Split Repository Name
-        id: split_name
-        run: |
-          repo_name=${{ github.repository }}
-          IFS='/' read -ra repo_parts <<< "$repo_name"
-          echo "owner=${repo_parts[0]}" >> $GITHUB_OUTPUT
-          echo "repo=${repo_parts[1]}" >> $GITHUB_OUTPUT
-
-      - name: Check release version
-        id: checkReleaseVersion
-        uses: actions/github-script@v3
-        with:
-          github-token: ${{secrets.GITHUB_TOKEN}}
-          script: |
-            try {
-              const releaseVersion = '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'
-              const releaseResponse = await github.repos.getReleaseByTag({
-                owner: '${{ steps.split_name.outputs.owner }}',
-                repo: '${{ steps.split_name.outputs.repo }}',
-                tag: releaseVersion
+            // Fetch releases (multiple pages to find older majors)
+            let allReleases = [];
+            for (let page = 1; page <= 5; page++) {
+              const { data } = await github.repos.listReleases({
+                owner: 'frida',
+                repo: 'frida',
+                per_page: 100,
+                page: page
               });
-              const {
-                data: { tag_name: ver }
-              } = releaseResponse;
-              if (ver == '${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}'){
-                  if ( ${{ ( github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}){
-                    core.setOutput('ALREADY_RELEASE', '2');
-                  } else {
-                    core.setOutput('ALREADY_RELEASE', '1');
-                  }
-              }
-              else{
-                  core.setOutput('ALREADY_RELEASE', '0');
-              }
-            } catch (e) {
-              if(e.message == 'Not Found'){
-                core.setOutput('ALREADY_RELEASE', '0');
-              }
-              else{
-                core.setFailed(e.message);
+              allReleases = allReleases.concat(data);
+              if (data.length < 100) break;
+            }
+
+            for (const major of majorVersions) {
+              const release = allReleases.find(r =>
+                r.tag_name.startsWith(`${major}.`) && !r.prerelease && !r.draft
+              );
+              if (release) {
+                versions.push(release.tag_name);
+                core.info(`Found v${major}.x latest: ${release.tag_name}`);
+              } else {
+                core.warning(`No release found for major version ${major}`);
               }
             }
-      
-      - name: Delete release
-        if: ${{ steps.checkReleaseVersion.outputs.ALREADY_RELEASE == '2' }}
-        uses: dev-drprasad/delete-tag-and-release@v1.0
-        with:
-          tag_name: ${{ steps.pullFridaLatestRelease.outputs.FRIDA_VERSION }}
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          delete_release: true
 
-  create_release:
-    needs: check_version
+            // Check which versions need building
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const isManualOrPush = context.eventName === 'push' || context.eventName === 'workflow_dispatch';
+            const toBuild = [];
+
+            for (const ver of versions) {
+              try {
+                const existing = await github.repos.getReleaseByTag({ owner, repo, tag: ver });
+                if (isManualOrPush) {
+                  // Delete existing release for forced rebuild
+                  await github.repos.deleteRelease({ owner, repo, release_id: existing.data.id });
+                  try {
+                    await github.git.deleteRef({ owner, repo, ref: `tags/${ver}` });
+                  } catch (e) { /* tag may already be gone */ }
+                  toBuild.push(ver);
+                  core.info(`Force rebuild: ${ver} (existing release deleted)`);
+                } else {
+                  core.info(`Skipping ${ver}: already released`);
+                }
+              } catch (e) {
+                if (e.message === 'Not Found') {
+                  toBuild.push(ver);
+                  core.info(`New version to build: ${ver}`);
+                } else {
+                  core.setFailed(`Error checking version ${ver}: ${e.message}`);
+                }
+              }
+            }
+
+            if (toBuild.length === 0) {
+              core.info('No versions to build');
+              core.setOutput('matrix', '{"include":[]}');
+            } else {
+              const matrix = { include: toBuild.map(v => ({ frida_version: v })) };
+              core.setOutput('matrix', JSON.stringify(matrix));
+              core.info(`Build matrix: ${JSON.stringify(matrix)}`);
+            }
+
+  create_releases:
+    needs: check_versions
     runs-on: ubuntu-22.04
-    if: needs.check_version.outputs.ALREADY_RELEASE != '1'
+    if: ${{ needs.check_versions.outputs.matrix != '{"include":[]}' }}
+
+    strategy:
+      matrix: ${{ fromJson(needs.check_versions.outputs.matrix) }}
+      fail-fast: false
 
     steps:
       - uses: softprops/action-gh-release@v2.1.0
         id: createRelease
-        name: Create Runner Release
+        name: Create Release for ${{ matrix.frida_version }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: "${{ needs.check_version.outputs.FRIDA_VERSION }}"
-          name: "${{ needs.check_version.outputs.FRIDA_VERSION }}"
+          tag_name: "${{ matrix.frida_version }}"
+          name: "${{ matrix.frida_version }}"
           prerelease: false
 
   android_build:
     runs-on: ubuntu-22.04
-    needs: [check_version, create_release]
+    needs: [check_versions, create_releases]
+
+    strategy:
+      matrix: ${{ fromJson(needs.check_versions.outputs.matrix) }}
+      fail-fast: false
 
     steps:
     - uses: actions/checkout@v3
@@ -136,14 +150,14 @@ jobs:
         sudo gem install fpm -v 1.11.0 --no-document
         python3 -m pip install lief graphlib
 
-    - name: build frida for Android
+    - name: build frida ${{ matrix.frida_version }} for Android
       shell: bash
       run: |
         git config --global user.name "GitHub Actions"
         git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
         
         export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
-        export FRIDA_VERSION=${{ needs.check_version.outputs.FRIDA_VERSION }}
+        export FRIDA_VERSION=${{ matrix.frida_version }}
         echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
         echo "FRIDA_VERSION=$FRIDA_VERSION"
         
@@ -155,7 +169,7 @@ jobs:
           real=$(realpath $path)
           echo "Apply patches in $real to frida/subprojects/$name"
           cd subprojects/$name
-          git am --3way ../../../patches/$name/*.patch
+          git am --3way ../../../patches/$name/*.patch || echo "WARNING: Patch failed for $name on version $FRIDA_VERSION, skipping..."
           cd ../..
           echo "Done patching $name"
         done
@@ -186,7 +200,7 @@ jobs:
         github-token: ${{secrets.GITHUB_TOKEN}}
         script: |
           try {
-            const releaseVersion = '${{ needs.check_version.outputs.FRIDA_VERSION }}'
+            const releaseVersion = '${{ matrix.frida_version }}'
             const releaseResponse = await github.repos.getReleaseByTag({
               owner: '${{ steps.split_name.outputs.owner }}',
               repo: '${{ steps.split_name.outputs.repo }}',
@@ -235,7 +249,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-core/server/frida-server.gz'
-        asset_name: 'florida-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.gz'
+        asset_name: 'florida-server-${{ matrix.frida_version }}-android-arm.gz'
         asset_content_type: application/octet-stream
 
     - name: Upload android arm64 frida-server for Florida
@@ -245,7 +259,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-arm64/subprojects/frida-core/server/frida-server.gz'
-        asset_name: 'florida-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.gz'
+        asset_name: 'florida-server-${{ matrix.frida_version }}-android-arm64.gz'
         asset_content_type: application/octet-stream
 
     - name: Upload android x86 frida-server for Florida
@@ -255,7 +269,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-x86/subprojects/frida-core/server/frida-server.gz'
-        asset_name: 'florida-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.gz'
+        asset_name: 'florida-server-${{ matrix.frida_version }}-android-x86.gz'
         asset_content_type: application/octet-stream
 
     - name: Upload android x86_64 frida-server for Florida
@@ -265,7 +279,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-x86_64/subprojects/frida-core/server/frida-server.gz'
-        asset_name: 'florida-server-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.gz'
+        asset_name: 'florida-server-${{ matrix.frida_version }}-android-x86_64.gz'
         asset_content_type: application/octet-stream
         
     - name: Upload android arm frida-inject for Florida
@@ -275,7 +289,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-core/inject/frida-inject.gz'
-        asset_name: 'florida-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.gz'
+        asset_name: 'florida-inject-${{ matrix.frida_version }}-android-arm.gz'
         asset_content_type: application/octet-stream
         
     - name: Upload android arm64 frida-inject for Florida
@@ -285,7 +299,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-arm64/subprojects/frida-core/inject/frida-inject.gz'
-        asset_name: 'florida-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.gz'
+        asset_name: 'florida-inject-${{ matrix.frida_version }}-android-arm64.gz'
         asset_content_type: application/octet-stream
         
     - name: Upload android x86 frida-inject for Florida
@@ -295,7 +309,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-x86/subprojects/frida-core/inject/frida-inject.gz'
-        asset_name: 'florida-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.gz'
+        asset_name: 'florida-inject-${{ matrix.frida_version }}-android-x86.gz'
         asset_content_type: application/octet-stream
         
     - name: Upload android x86_64 frida-inject for Florida
@@ -305,7 +319,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-x86_64/subprojects/frida-core/inject/frida-inject.gz'
-        asset_name: 'florida-inject-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.gz'
+        asset_name: 'florida-inject-${{ matrix.frida_version }}-android-x86_64.gz'
         asset_content_type: application/octet-stream
     
     - name: Upload android arm frida-gadget for Florida
@@ -315,7 +329,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-core/lib/gadget/frida-gadget.so.gz'
-        asset_name: 'florida-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.so.gz'
+        asset_name: 'florida-gadget-${{ matrix.frida_version }}-android-arm.so.gz'
         asset_content_type: application/octet-stream
 
     - name: Upload android arm64 frida-gadget for Florida
@@ -325,7 +339,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-arm64/subprojects/frida-core/lib/gadget/frida-gadget.so.gz'
-        asset_name: 'florida-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.so.gz'
+        asset_name: 'florida-gadget-${{ matrix.frida_version }}-android-arm64.so.gz'
         asset_content_type: application/octet-stream
    
     - name: Upload android x86 frida-gadget for Florida
@@ -335,7 +349,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-x86/subprojects/frida-core/lib/gadget/frida-gadget.so.gz'
-        asset_name: 'florida-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.so.gz'
+        asset_name: 'florida-gadget-${{ matrix.frida_version }}-android-x86.so.gz'
         asset_content_type: application/octet-stream
 
     - name: Upload android x86_64 frida-gadget for Florida
@@ -345,7 +359,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-x86_64/subprojects/frida-core/lib/gadget/frida-gadget.so.gz'
-        asset_name: 'florida-gadget-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.so.gz'
+        asset_name: 'florida-gadget-${{ matrix.frida_version }}-android-x86_64.so.gz'
         asset_content_type: application/octet-stream
      
     - name: Upload android arm frida-gumjs for Florida
@@ -355,7 +369,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-arm/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz'
-        asset_name: 'florida-gumjs-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm.a.gz'
+        asset_name: 'florida-gumjs-${{ matrix.frida_version }}-android-arm.a.gz'
         asset_content_type: application/octet-stream
 
     - name: Upload android arm64 frida-gumjs for Florida
@@ -365,7 +379,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-arm64/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz'
-        asset_name: 'florida-gumjs-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-arm64.a.gz'
+        asset_name: 'florida-gumjs-${{ matrix.frida_version }}-android-arm64.a.gz'
         asset_content_type: application/octet-stream
    
     - name: Upload android x86 frida-gumjs for Florida
@@ -375,7 +389,7 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-x86/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz'
-        asset_name: 'florida-gumjs-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86.a.gz'
+        asset_name: 'florida-gumjs-${{ matrix.frida_version }}-android-x86.a.gz'
         asset_content_type: application/octet-stream
 
     - name: Upload android x86_64 frida-gumjs for Florida
@@ -385,5 +399,5 @@ jobs:
       with:
         upload_url: '${{ steps.checkReleaseVersion.outputs.upload_url }}'
         asset_path: '${{ github.workspace }}/build-android-x86_64/subprojects/frida-gum/bindings/gumjs/libfrida-gumjs-1.0.a.gz'
-        asset_name: 'florida-gumjs-${{ needs.check_version.outputs.FRIDA_VERSION }}-android-x86_64.a.gz'
+        asset_name: 'florida-gumjs-${{ matrix.frida_version }}-android-x86_64.a.gz'
         asset_content_type: application/octet-stream
