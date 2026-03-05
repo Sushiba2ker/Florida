@@ -61,26 +61,46 @@ jobs:
             const isManualOrPush = context.eventName === 'push' || context.eventName === 'workflow_dispatch';
             const toBuild = [];
 
+            // Helper: retry API calls with delay
+            async function withRetry(fn, retries = 3, delayMs = 5000) {
+              for (let i = 0; i < retries; i++) {
+                try {
+                  return await fn();
+                } catch (e) {
+                  if (i < retries - 1 && (!e.status || e.status >= 500)) {
+                    core.warning(`API call failed (attempt ${i+1}/${retries}), retrying in ${delayMs}ms: ${e.status || e.message}`);
+                    await new Promise(r => setTimeout(r, delayMs));
+                  } else {
+                    throw e;
+                  }
+                }
+              }
+            }
+
             for (const ver of versions) {
               try {
-                const existing = await github.repos.getReleaseByTag({ owner, repo, tag: ver });
+                const existing = await withRetry(() => github.repos.getReleaseByTag({ owner, repo, tag: ver }));
                 if (isManualOrPush) {
                   // Delete existing release for forced rebuild
-                  await github.repos.deleteRelease({ owner, repo, release_id: existing.data.id });
+                  await withRetry(() => github.repos.deleteRelease({ owner, repo, release_id: existing.data.id }));
                   try {
-                    await github.git.deleteRef({ owner, repo, ref: `tags/${ver}` });
+                    await withRetry(() => github.git.deleteRef({ owner, repo, ref: `tags/${ver}` }));
                   } catch (e) { /* tag may already be gone */ }
                   toBuild.push(ver);
                   core.info(`Force rebuild: ${ver} (existing release deleted)`);
+                  // Wait a bit after deletion to avoid rate limits
+                  await new Promise(r => setTimeout(r, 3000));
                 } else {
                   core.info(`Skipping ${ver}: already released`);
                 }
               } catch (e) {
-                if (e.message === 'Not Found') {
+                if (e.status === 404 || e.message === 'Not Found') {
                   toBuild.push(ver);
                   core.info(`New version to build: ${ver}`);
                 } else {
-                  core.setFailed(`Error checking version ${ver}: ${e.message}`);
+                  // Don't fail entire workflow for transient errors - just skip this version
+                  core.warning(`Error checking version ${ver} (status: ${e.status}), adding to build anyway: ${e.message.substring(0, 100)}`);
+                  toBuild.push(ver);
                 }
               }
             }
