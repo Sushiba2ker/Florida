@@ -144,22 +144,76 @@ jobs:
         do
           mkdir -p out/$ARCH
           SHORT_ARCH=$(echo $ARCH | sed 's/android-//')
-          
-          # Search everywhere for artifacts matching this architecture
-          SERVER=$(find . -path "*/frida-$ARCH*" -name "frida-server" -type f 2>/dev/null | head -1)
-          if [ -z "$SERVER" ]; then SERVER=$(find . -path "*$SHORT_ARCH*" -name "frida-server" -type f 2>/dev/null | head -1); fi
+
+          # Search for artifacts - use exact ARCH path to avoid arm/arm64 confusion
+          # Pattern must match EXACT architecture, not substrings (arm shouldn't match arm64)
+          SERVER=$(find . -type f -path "*/frida-$ARCH/*" -name "frida-server" 2>/dev/null | head -1)
+          if [ -z "$SERVER" ]; then SERVER=$(find . -type f -path "*/frida-$ARCH*" -name "frida-server" 2>/dev/null | head -1); fi
+          if [ -z "$SERVER" ]; then
+            # Fallback: use word boundary pattern to avoid arm matching arm64
+            case "$SHORT_ARCH" in
+              arm)
+                SERVER=$(find . -type f -path "*/android-arm/*" -name "frida-server" 2>/dev/null | grep -v "arm64" | head -1)
+                ;;
+              arm64)
+                SERVER=$(find . -type f -path "*/android-arm64/*" -name "frida-server" 2>/dev/null | head -1)
+                ;;
+              *)
+                SERVER=$(find . -type f -name "frida-server" 2>/dev/null | grep "$SHORT_ARCH" | head -1)
+                ;;
+            esac
+          fi
           if [ -n "$SERVER" ]; then cp "$SERVER" out/$ARCH/frida-server; echo "$ARCH server: $SERVER"; fi
-          
-          INJECT=$(find . -path "*/frida-$ARCH*" -name "frida-inject" -type f 2>/dev/null | head -1)
-          if [ -z "$INJECT" ]; then INJECT=$(find . -path "*$SHORT_ARCH*" -name "frida-inject" -type f 2>/dev/null | head -1); fi
+
+          INJECT=$(find . -type f -path "*/frida-$ARCH/*" -name "frida-inject" 2>/dev/null | head -1)
+          if [ -z "$INJECT" ]; then INJECT=$(find . -type f -path "*/frida-$ARCH*" -name "frida-inject" 2>/dev/null | head -1); fi
+          if [ -z "$INJECT" ]; then
+            case "$SHORT_ARCH" in
+              arm)
+                INJECT=$(find . -type f -path "*/android-arm/*" -name "frida-inject" 2>/dev/null | grep -v "arm64" | head -1)
+                ;;
+              arm64)
+                INJECT=$(find . -type f -path "*/android-arm64/*" -name "frida-inject" 2>/dev/null | head -1)
+                ;;
+              *)
+                INJECT=$(find . -type f -name "frida-inject" 2>/dev/null | grep "$SHORT_ARCH" | head -1)
+                ;;
+            esac
+          fi
           if [ -n "$INJECT" ]; then cp "$INJECT" out/$ARCH/frida-inject; echo "$ARCH inject: $INJECT"; fi
-          
-          GADGET=$(find . -path "*/frida-$ARCH*" -name "frida-gadget.so" -type f 2>/dev/null | head -1)
-          if [ -z "$GADGET" ]; then GADGET=$(find . -path "*$SHORT_ARCH*" -name "frida-gadget.so" -type f 2>/dev/null | head -1); fi
+
+          GADGET=$(find . -type f -path "*/frida-$ARCH/*" -name "frida-gadget.so" 2>/dev/null | head -1)
+          if [ -z "$GADGET" ]; then GADGET=$(find . -type f -path "*/frida-$ARCH*" -name "frida-gadget.so" 2>/dev/null | head -1); fi
+          if [ -z "$GADGET" ]; then
+            case "$SHORT_ARCH" in
+              arm)
+                GADGET=$(find . -type f -path "*/android-arm/*" -name "frida-gadget.so" 2>/dev/null | grep -v "arm64" | head -1)
+                ;;
+              arm64)
+                GADGET=$(find . -type f -path "*/android-arm64/*" -name "frida-gadget.so" 2>/dev/null | head -1)
+                ;;
+              *)
+                GADGET=$(find . -type f -name "frida-gadget.so" 2>/dev/null | grep "$SHORT_ARCH" | head -1)
+                ;;
+            esac
+          fi
           if [ -n "$GADGET" ]; then cp "$GADGET" out/$ARCH/frida-gadget.so; echo "$ARCH gadget: $GADGET"; fi
-          
-          GUMJS=$(find . -path "*/frida-$ARCH*" -name "libfrida-gumjs-1.0.a" -type f 2>/dev/null | head -1)
-          if [ -z "$GUMJS" ]; then GUMJS=$(find . -path "*$SHORT_ARCH*" -name "libfrida-gumjs-1.0.a" -type f 2>/dev/null | head -1); fi
+
+          GUMJS=$(find . -type f -path "*/frida-$ARCH/*" -name "libfrida-gumjs-1.0.a" 2>/dev/null | head -1)
+          if [ -z "$GUMJS" ]; then GUMJS=$(find . -type f -path "*/frida-$ARCH*" -name "libfrida-gumjs-1.0.a" 2>/dev/null | head -1); fi
+          if [ -z "$GUMJS" ]; then
+            case "$SHORT_ARCH" in
+              arm)
+                GUMJS=$(find . -type f -path "*/android-arm/*" -name "libfrida-gumjs-1.0.a" 2>/dev/null | grep -v "arm64" | head -1)
+                ;;
+              arm64)
+                GUMJS=$(find . -type f -path "*/android-arm64/*" -name "libfrida-gumjs-1.0.a" 2>/dev/null | head -1)
+                ;;
+              *)
+                GUMJS=$(find . -type f -name "libfrida-gumjs-1.0.a" 2>/dev/null | grep "$SHORT_ARCH" | head -1)
+                ;;
+            esac
+          fi
           if [ -n "$GUMJS" ]; then cp "$GUMJS" out/$ARCH/libfrida-gumjs-1.0.a; echo "$ARCH gumjs: $GUMJS"; fi
           
           # Gzip all found artifacts
