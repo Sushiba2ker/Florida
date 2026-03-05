@@ -1,0 +1,331 @@
+name: Florida v15
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "ci"]
+    paths:
+      - ".github/workflows/build-v15.yml"
+      - "patches/**"
+
+env:
+  FRIDA_VERSION: "15.2.2"
+
+jobs:
+  create_release:
+    runs-on: ubuntu-22.04
+
+    outputs:
+      upload_url: ${{ steps.manage_release.outputs.upload_url }}
+
+    steps:
+      - name: Manage release for v15
+        id: manage_release
+        uses: actions/github-script@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const tag = '${{ env.FRIDA_VERSION }}';
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // Delete existing release if present (force rebuild)
+            try {
+              const existing = await github.repos.getReleaseByTag({ owner, repo, tag });
+              await github.repos.deleteRelease({ owner, repo, release_id: existing.data.id });
+              try { await github.git.deleteRef({ owner, repo, ref: `tags/${tag}` }); } catch(e) {}
+              core.info(`Deleted existing release ${tag}`);
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+
+            // Create fresh release
+            const release = await github.repos.createRelease({
+              owner, repo,
+              tag_name: tag,
+              name: tag,
+              prerelease: false
+            });
+            core.setOutput('upload_url', release.data.upload_url);
+            core.info(`Created release ${tag}`);
+
+  android_build:
+    runs-on: ubuntu-22.04
+    needs: create_release
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - uses: actions/setup-node@v3
+      with:
+        node-version: 18
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        distribution: "temurin"
+        java-version: "17"
+
+    - name: Setup Android NDK
+      id: setup-ndk
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r25c
+        local-cache: false
+        link-to-sdk: true
+
+    - name: Set up Python 3.9
+      uses: actions/setup-python@v4
+      with:
+        python-version: 3.9
+
+    - name: install dependencies
+      run: |
+        sudo apt-get update && DEBIAN_FRONTEND=noninteractive sudo apt-get install build-essential tree ninja-build gcc-multilib g++-multilib lib32stdc++-9-dev flex bison ruby ruby-dev python3-requests python3-setuptools python3-dev python3-pip libc6-dev libc6-dev-i386 -y
+        sudo gem install fpm -v 1.11.0 --no-document
+        python3 -m pip install lief
+
+    - name: build frida v15 for Android
+      shell: bash
+      run: |
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        
+        export ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}
+        WORKSPACE=$(pwd)
+        echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
+        echo "FRIDA_VERSION=${{ env.FRIDA_VERSION }}"
+        
+        git clone --recurse-submodules --branch "${{ env.FRIDA_VERSION }}" --depth 1 https://github.com/frida/frida
+        cd frida
+        
+        # Apply patches (v15 uses root-level submodule layout)
+        for patch_dir in $WORKSPACE/patches/*
+        do
+          name=$(basename $patch_dir)
+          if [ -d "$name" ]; then
+            echo "=== Patching $name ==="
+            cd "$name"
+            git am --3way $WORKSPACE/patches/$name/*.patch || echo "WARNING: Patch failed for $name, skipping..."
+            cd ..
+          else
+            echo "SKIP: $name not found in frida root"
+          fi
+        done
+        
+        # v15 uses Makefile-based in-tree build
+        ARCHES="android-arm android-arm64 android-x86 android-x86_64"
+        for ARCH in $ARCHES
+        do
+          echo ""
+          echo "========================================="
+          echo "Building core for $ARCH"
+          echo "========================================="
+          make core-$ARCH
+        done
+        
+        cd $WORKSPACE
+        
+        # Debug: show all build artifacts
+        echo ""
+        echo "=== All build artifacts ==="
+        find frida/build -type f \( -name "frida-server" -o -name "frida-inject" -o -name "frida-gadget.so" -o -name "libfrida-gumjs-1.0.a" \) 2>/dev/null || echo "No artifacts found in frida/build"
+        find frida -maxdepth 5 -type f -name "frida-server" 2>/dev/null || echo "No frida-server found anywhere"
+        
+        # Tree the build directory structure
+        tree frida/build -L 4 2>/dev/null || find frida/build -maxdepth 4 -type d 2>/dev/null || echo "No build directory found"
+
+    - name: package build result for Android
+      shell: bash
+      run: |
+        ARCHES="android-arm android-arm64 android-x86 android-x86_64"
+        
+        for ARCH in $ARCHES
+        do
+          mkdir -p out/$ARCH
+          SHORT_ARCH=$(echo $ARCH | sed 's/android-//')
+          
+          # Search everywhere for artifacts matching this architecture
+          SERVER=$(find . -path "*/frida-$ARCH*" -name "frida-server" -type f 2>/dev/null | head -1)
+          if [ -z "$SERVER" ]; then SERVER=$(find . -path "*$SHORT_ARCH*" -name "frida-server" -type f 2>/dev/null | head -1); fi
+          if [ -n "$SERVER" ]; then cp "$SERVER" out/$ARCH/frida-server; echo "$ARCH server: $SERVER"; fi
+          
+          INJECT=$(find . -path "*/frida-$ARCH*" -name "frida-inject" -type f 2>/dev/null | head -1)
+          if [ -z "$INJECT" ]; then INJECT=$(find . -path "*$SHORT_ARCH*" -name "frida-inject" -type f 2>/dev/null | head -1); fi
+          if [ -n "$INJECT" ]; then cp "$INJECT" out/$ARCH/frida-inject; echo "$ARCH inject: $INJECT"; fi
+          
+          GADGET=$(find . -path "*/frida-$ARCH*" -name "frida-gadget.so" -type f 2>/dev/null | head -1)
+          if [ -z "$GADGET" ]; then GADGET=$(find . -path "*$SHORT_ARCH*" -name "frida-gadget.so" -type f 2>/dev/null | head -1); fi
+          if [ -n "$GADGET" ]; then cp "$GADGET" out/$ARCH/frida-gadget.so; echo "$ARCH gadget: $GADGET"; fi
+          
+          GUMJS=$(find . -path "*/frida-$ARCH*" -name "libfrida-gumjs-1.0.a" -type f 2>/dev/null | head -1)
+          if [ -z "$GUMJS" ]; then GUMJS=$(find . -path "*$SHORT_ARCH*" -name "libfrida-gumjs-1.0.a" -type f 2>/dev/null | head -1); fi
+          if [ -n "$GUMJS" ]; then cp "$GUMJS" out/$ARCH/libfrida-gumjs-1.0.a; echo "$ARCH gumjs: $GUMJS"; fi
+          
+          # Gzip all found artifacts
+          for f in out/$ARCH/*; do
+            if [ -f "$f" ]; then gzip "$f"; fi
+          done
+          
+          echo "Packaged $ARCH: $(ls out/$ARCH/ 2>/dev/null || echo 'EMPTY')"
+        done
+
+    - name: Upload android arm frida-server
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-arm/frida-server.gz'
+        asset_name: 'florida-server-${{ env.FRIDA_VERSION }}-android-arm.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android arm64 frida-server
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-arm64/frida-server.gz'
+        asset_name: 'florida-server-${{ env.FRIDA_VERSION }}-android-arm64.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android x86 frida-server
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-x86/frida-server.gz'
+        asset_name: 'florida-server-${{ env.FRIDA_VERSION }}-android-x86.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android x86_64 frida-server
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-x86_64/frida-server.gz'
+        asset_name: 'florida-server-${{ env.FRIDA_VERSION }}-android-x86_64.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android arm frida-inject
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-arm/frida-inject.gz'
+        asset_name: 'florida-inject-${{ env.FRIDA_VERSION }}-android-arm.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android arm64 frida-inject
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-arm64/frida-inject.gz'
+        asset_name: 'florida-inject-${{ env.FRIDA_VERSION }}-android-arm64.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android x86 frida-inject
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-x86/frida-inject.gz'
+        asset_name: 'florida-inject-${{ env.FRIDA_VERSION }}-android-x86.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android x86_64 frida-inject
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-x86_64/frida-inject.gz'
+        asset_name: 'florida-inject-${{ env.FRIDA_VERSION }}-android-x86_64.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android arm frida-gadget
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-arm/frida-gadget.so.gz'
+        asset_name: 'florida-gadget-${{ env.FRIDA_VERSION }}-android-arm.so.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android arm64 frida-gadget
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-arm64/frida-gadget.so.gz'
+        asset_name: 'florida-gadget-${{ env.FRIDA_VERSION }}-android-arm64.so.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android x86 frida-gadget
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-x86/frida-gadget.so.gz'
+        asset_name: 'florida-gadget-${{ env.FRIDA_VERSION }}-android-x86.so.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android x86_64 frida-gadget
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-x86_64/frida-gadget.so.gz'
+        asset_name: 'florida-gadget-${{ env.FRIDA_VERSION }}-android-x86_64.so.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android arm frida-gumjs
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-arm/libfrida-gumjs-1.0.a.gz'
+        asset_name: 'florida-gumjs-${{ env.FRIDA_VERSION }}-android-arm.a.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android arm64 frida-gumjs
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-arm64/libfrida-gumjs-1.0.a.gz'
+        asset_name: 'florida-gumjs-${{ env.FRIDA_VERSION }}-android-arm64.a.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android x86 frida-gumjs
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-x86/libfrida-gumjs-1.0.a.gz'
+        asset_name: 'florida-gumjs-${{ env.FRIDA_VERSION }}-android-x86.a.gz'
+        asset_content_type: application/octet-stream
+
+    - name: Upload android x86_64 frida-gumjs
+      uses: actions/upload-release-asset@v1.0.2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: '${{ needs.create_release.outputs.upload_url }}'
+        asset_path: '${{ github.workspace }}/out/android-x86_64/libfrida-gumjs-1.0.a.gz'
+        asset_name: 'florida-gumjs-${{ env.FRIDA_VERSION }}-android-x86_64.a.gz'
+        asset_content_type: application/octet-stream

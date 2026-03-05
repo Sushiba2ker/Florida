@@ -23,7 +23,7 @@ jobs:
         with:
           github-token: ${{secrets.GITHUB_TOKEN}}
           script: |
-            const majorVersions = [15, 16, 17];
+            const majorVersions = [16, 17];
             const versions = [];
 
             // Use Tags API (lightweight) instead of Releases API (heavy, causes 504)
@@ -165,64 +165,35 @@ jobs:
         WORKSPACE=$(pwd)
         echo "ANDROID_NDK_ROOT=$ANDROID_NDK_ROOT"
         echo "FRIDA_VERSION=$FRIDA_VERSION"
-        echo "WORKSPACE=$WORKSPACE"
         
         git clone --recurse-submodules --branch "$FRIDA_VERSION" --depth 1 https://github.com/frida/frida
         cd frida
         
-        # Detect directory structure: v16+ uses subprojects/, v15 uses root-level
-        if [ -d "subprojects/frida-core" ]; then
-          SUBDIR="subprojects"
-          echo "Detected subprojects/ layout (v16+)"
-        else
-          SUBDIR="."
-          echo "Detected root-level layout (v15)"
-        fi
-        
-        # Apply patches using absolute paths (works for any layout depth)
-        for path in $WORKSPACE/patches/*
+        # Apply patches (v16+ uses subprojects/ layout)
+        for patch_dir in $WORKSPACE/patches/*
         do
-          name=$(basename $path)
-          target_dir="$SUBDIR/$name"
-          if [ -d "$target_dir" ]; then
-            echo "Apply patches to frida/$target_dir"
-            cd "$target_dir"
+          name=$(basename $patch_dir)
+          if [ -d "subprojects/$name" ]; then
+            echo "=== Patching subprojects/$name ==="
+            cd "subprojects/$name"
             git am --3way $WORKSPACE/patches/$name/*.patch || echo "WARNING: Patch failed for $name on version $FRIDA_VERSION, skipping..."
             cd - > /dev/null
-            echo "Done patching $name"
           else
-            echo "SKIP: $target_dir not found, skipping patches for $name"
+            echo "SKIP: subprojects/$name not found"
           fi
         done
         cd $WORKSPACE
         
+        # Build using configure + make (v16+ build system)
         ARCHES="android-arm android-arm64 android-x86 android-x86_64"
-        
-        # Detect build system: v16+ has configure script, v15 uses Makefile
-        if [ -f "frida/configure" ]; then
-          echo "=== Using configure + make (v16+) ==="
-          for ARCH in $ARCHES
-          do
-            mkdir build-$ARCH
-            cd build-$ARCH
-            ../frida/configure --host=$ARCH
-            make
-            cd ..
-          done
-        else
-          echo "=== Using Makefile (v15) ==="
-          cd frida
-          for ARCH in $ARCHES
-          do
-            echo "Building frida-server for $ARCH..."
-            make server-$ARCH || make core-$ARCH || echo "WARNING: server build failed for $ARCH"
-            echo "Building frida-inject for $ARCH..."
-            make inject-$ARCH || true
-            echo "Building frida-gadget for $ARCH..."
-            make gadget-$ARCH || true
-          done
+        for ARCH in $ARCHES
+        do
+          mkdir build-$ARCH
+          cd build-$ARCH
+          ../frida/configure --host=$ARCH
+          make
           cd ..
-        fi
+        done
     
     - name: Split Repository Name
       id: split_name
@@ -259,52 +230,28 @@ jobs:
     - name: package build result for Android
       shell: bash
       run: |
-        # Normalize output: find artifacts in either location and copy to consistent out/ directory
-        # v16+ puts artifacts in build-$ARCH/, v15 puts them in frida/build/
         ARCHES="android-arm android-arm64 android-x86 android-x86_64"
-        
-        echo "=== Searching for build artifacts ==="
-        find . -name "frida-server" -type f 2>/dev/null || echo "No frida-server found"
-        find . -name "frida-inject" -type f 2>/dev/null || echo "No frida-inject found"
-        find . -name "frida-gadget.so" -type f 2>/dev/null || echo "No frida-gadget.so found"
-        find . -name "libfrida-gumjs-1.0.a" -type f 2>/dev/null || echo "No libfrida-gumjs found"
-        
         for ARCH in $ARCHES
         do
           mkdir -p out/$ARCH
           
-          # Search both possible build output locations
-          SEARCH_DIRS=""
-          if [ -d "build-$ARCH" ]; then SEARCH_DIRS="$SEARCH_DIRS build-$ARCH"; fi
-          if [ -d "frida/build" ]; then SEARCH_DIRS="$SEARCH_DIRS frida/build"; fi
-          if [ -z "$SEARCH_DIRS" ]; then
-            echo "WARNING: No build directories found for $ARCH"
-            continue
-          fi
+          SERVER=$(find build-$ARCH -name "frida-server" -type f | head -1)
+          if [ -n "$SERVER" ]; then cp "$SERVER" out/$ARCH/frida-server; fi
           
-          # Find and copy artifacts (grep ARCH to match correct architecture)
-          SERVER=$(find $SEARCH_DIRS -name "frida-server" -type f 2>/dev/null | grep -i "$ARCH\|$(echo $ARCH | sed 's/android-//')" | head -1)
-          if [ -z "$SERVER" ]; then SERVER=$(find $SEARCH_DIRS -name "frida-server" -type f 2>/dev/null | head -1); fi
-          if [ -n "$SERVER" ]; then cp "$SERVER" out/$ARCH/frida-server; echo "  server: $SERVER"; fi
+          INJECT=$(find build-$ARCH -name "frida-inject" -type f | head -1)
+          if [ -n "$INJECT" ]; then cp "$INJECT" out/$ARCH/frida-inject; fi
           
-          INJECT=$(find $SEARCH_DIRS -name "frida-inject" -type f 2>/dev/null | grep -i "$ARCH\|$(echo $ARCH | sed 's/android-//')" | head -1)
-          if [ -z "$INJECT" ]; then INJECT=$(find $SEARCH_DIRS -name "frida-inject" -type f 2>/dev/null | head -1); fi
-          if [ -n "$INJECT" ]; then cp "$INJECT" out/$ARCH/frida-inject; echo "  inject: $INJECT"; fi
+          GADGET=$(find build-$ARCH -name "frida-gadget.so" -type f | head -1)
+          if [ -n "$GADGET" ]; then cp "$GADGET" out/$ARCH/frida-gadget.so; fi
           
-          GADGET=$(find $SEARCH_DIRS -name "frida-gadget.so" -type f 2>/dev/null | grep -i "$ARCH\|$(echo $ARCH | sed 's/android-//')" | head -1)
-          if [ -z "$GADGET" ]; then GADGET=$(find $SEARCH_DIRS -name "frida-gadget.so" -type f 2>/dev/null | head -1); fi
-          if [ -n "$GADGET" ]; then cp "$GADGET" out/$ARCH/frida-gadget.so; echo "  gadget: $GADGET"; fi
+          GUMJS=$(find build-$ARCH -name "libfrida-gumjs-1.0.a" -type f | head -1)
+          if [ -n "$GUMJS" ]; then cp "$GUMJS" out/$ARCH/libfrida-gumjs-1.0.a; fi
           
-          GUMJS=$(find $SEARCH_DIRS -name "libfrida-gumjs-1.0.a" -type f 2>/dev/null | grep -i "$ARCH\|$(echo $ARCH | sed 's/android-//')" | head -1)
-          if [ -z "$GUMJS" ]; then GUMJS=$(find $SEARCH_DIRS -name "libfrida-gumjs-1.0.a" -type f 2>/dev/null | head -1); fi
-          if [ -n "$GUMJS" ]; then cp "$GUMJS" out/$ARCH/libfrida-gumjs-1.0.a; echo "  gumjs: $GUMJS"; fi
-          
-          # Gzip all found artifacts
           for f in out/$ARCH/*; do
             if [ -f "$f" ]; then gzip "$f"; fi
           done
           
-          echo "Packaged $ARCH: $(ls out/$ARCH/ 2>/dev/null || echo 'EMPTY')"
+          echo "Packaged $ARCH: $(ls out/$ARCH/)"
         done
         
 
