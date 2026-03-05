@@ -106,7 +106,7 @@ jobs:
           if [ -d "$name" ]; then
             echo "=== Patching $name ==="
             cd "$name"
-            git am --3way $WORKSPACE/patches/$name/*.patch || echo "WARNING: Patch failed for $name, skipping..."
+            git am --3way $WORKSPACE/patches/$name/*.patch || { echo "WARNING: Patch failed for $name, aborting and using unpatched version..."; git am --abort; }
             cd ..
           else
             echo "SKIP: $name not found in frida root"

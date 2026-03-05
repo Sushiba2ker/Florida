@@ -196,7 +196,7 @@ jobs:
           if [ -d "subprojects/$name" ]; then
             echo "=== Patching subprojects/$name ==="
             cd "subprojects/$name"
-            git am --3way $WORKSPACE/patches/$name/*.patch || echo "WARNING: Patch failed for $name on version $FRIDA_VERSION, skipping..."
+            git am --3way $WORKSPACE/patches/$name/*.patch || { echo "WARNING: Patch failed for $name, aborting..."; git am --abort; }
             cd - > /dev/null
           else
             echo "SKIP: subprojects/$name not found"
