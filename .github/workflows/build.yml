@@ -207,67 +207,8 @@ jobs:
         ANTI_SCRIPT="subprojects/frida-core/src/anti-anti-frida.py"
         if [ -f "$ANTI_SCRIPT" ]; then
           echo "=== Fixing anti-anti-frida.py for Java bridge ==="
-          cp "$ANTI_SCRIPT" "$ANTI_SCRIPT.bak"
-          cat > "$ANTI_SCRIPT" << 'PYEOF'
-import lief
-import sys
-import random
-import os
-
-# Keywords in symbol names that belong to Java bridge - DO NOT rename
-JAVA_BRIDGE_SKIP = ["_java", "_jvm", "java_bridge", "_jni", "dalvik", "art_"]
-
-def should_skip(name):
-    nl = name.lower()
-    for kw in JAVA_BRIDGE_SKIP:
-        if kw in nl:
-            return True
-    return False
-
-if __name__ == "__main__":
-    input_file = sys.argv[1]
-    print(f"[*] Patch frida-agent: {input_file}")
-    random_name = "".join(random.sample("ABCDEFGHIJKLMNO", 5))
-    print(f"[*] Patch `frida` to `{random_name}` (preserving Java bridge)")
-
-    binary = lief.parse(input_file)
-    if not binary:
-        exit()
-
-    renamed = 0
-    skipped = 0
-    for symbol in binary.symbols:
-        if symbol.name == "frida_agent_main":
-            symbol.name = "main"
-            renamed += 1
-            continue
-        if "frida" in symbol.name:
-            if should_skip(symbol.name):
-                skipped += 1
-            else:
-                symbol.name = symbol.name.replace("frida", random_name)
-                renamed += 1
-        if "FRIDA" in symbol.name:
-            if should_skip(symbol.name):
-                skipped += 1
-            else:
-                symbol.name = symbol.name.replace("FRIDA", random_name)
-                renamed += 1
-
-    print(f"[*] Renamed {renamed}, skipped {skipped} (Java bridge preserved)")
-    binary.write(input_file)
-
-    # gum-js-loop thread (same length replacement)
-    rn = "".join(random.sample("abcdefghijklmn", 11))
-    print(f"[*] Patch `gum-js-loop` to `{rn}`")
-    os.system(f"sed -b -i s/gum-js-loop/{rn}/g {input_file}")
-
-    # gmain thread (same length replacement)
-    rn2 = "".join(random.sample("abcdefghijklmn", 5))
-    print(f"[*] Patch `gmain` to `{rn2}`")
-    os.system(f"sed -b -i s/gmain/{rn2}/g {input_file}")
-PYEOF
-          echo "=== anti-anti-frida.py fixed ==="
+          cp "$WORKSPACE/patches/frida-core/anti-anti-frida-fixed.py" "$ANTI_SCRIPT"
+          echo "=== Done: Java bridge symbols will be preserved ==="
         fi
         
         cd $WORKSPACE
